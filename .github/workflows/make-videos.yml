@@ -18,10 +18,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install system tools (FFmpeg + eSpeak for free TTS)
+           - name: Install system tools (FFmpeg + eSpeak + fonts)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg espeak-ng
+          sudo apt-get install -y ffmpeg espeak-ng fonts-dejavu-core
+
 
       - name: Install Python packages
         run: |
