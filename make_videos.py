@@ -1,8 +1,8 @@
+# make_videos.py  (ASCII-only; safe on GitHub Actions)
 import os
 import textwrap
 import datetime
 import random
-import io
 from pathlib import Path
 
 import numpy as np
@@ -10,14 +10,14 @@ import pandas as pd
 from pytz import timezone, UTC
 import requests
 
-# MoviePy (no ImageMagick needed because we draw text with PIL and use ImageClip)
+# MoviePy (no ImageMagick needed; we draw text with PIL and drop as ImageClip)
 from moviepy.editor import VideoFileClip, ImageClip, AudioFileClip, CompositeVideoClip, ColorClip
 from moviepy.audio.AudioClip import CompositeAudioClip
 
-# Free TTS (uses espeak-ng on Linux runner)
+# Free TTS (uses espeak-ng on Ubuntu runner)
 import pyttsx3
 
-# PIL for drawing text panels safely
+# PIL for drawing text panels (no ImageMagick)
 from PIL import Image, ImageDraw, ImageFont
 
 # YouTube API client
@@ -25,7 +25,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# -------- Environment variables (set in GitHub Secrets) --------
+
+# ---------- Environment ----------
 PEXELS_API_KEY   = os.getenv("PEXELS_API_KEY", "")
 YT_CLIENT_ID     = os.getenv("YT_CLIENT_ID")
 YT_CLIENT_SECRET = os.getenv("YT_CLIENT_SECRET")
@@ -34,10 +35,13 @@ YT_REFRESH_TOKEN = os.getenv("YT_REFRESH_TOKEN")
 PT = timezone("America/Los_Angeles")
 RENDERS = Path("renders"); RENDERS.mkdir(exist_ok=True)
 TMP     = Path("tmp"); TMP.mkdir(exist_ok=True)
-MUSIC_DIR = Path("music")  # optional mp3 files from YouTube Audio Library
+MUSIC_DIR = Path("music")  # optional mp3s from YouTube Audio Library
 
-# -------- YouTube helpers --------
+
+# ---------- YouTube helpers ----------
 def yt_client():
+    if not (YT_CLIENT_ID and YT_CLIENT_SECRET and YT_REFRESH_TOKEN):
+        raise RuntimeError("Missing YouTube OAuth secrets. Set YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN.")
     creds = Credentials(
         None,
         refresh_token=YT_REFRESH_TOKEN,
@@ -49,10 +53,12 @@ def yt_client():
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 def schedule_to_iso_utc(pacific_str):
-    dt = PT.localize(datetime.datetime.strptime(pacific_str, "%Y-%m-%d %H:%M"))
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # CSV uses Pacific local time; YouTube needs ISO-8601 UTC for publishAt
+    dt_pt = PT.localize(datetime.datetime.strptime(pacific_str, "%Y-%m-%d %H:%M"))
+    return dt_pt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# -------- Pexels helpers --------
+
+# ---------- Pexels helpers ----------
 def pexels_portrait_video(query):
     if not PEXELS_API_KEY:
         return None
@@ -65,16 +71,16 @@ def pexels_portrait_video(query):
     if r.status_code != 200:
         return None
     data = r.json()
-    # pick a portrait file (h > w) if possible
+    # Pick a portrait file (h > w)
     for v in data.get("videos", []):
         files = sorted(v.get("video_files", []), key=lambda f: f.get("width", 0))
         for f in files:
             if f.get("height", 0) > f.get("width", 0) and f.get("link"):
                 return f["link"]
-    return None  # fallback later
+    return None
 
 def download_to_tmp(url, suffix):
-    p = TMP / f"dl_{random.randint(100000,999999)}{suffix}"
+    p = TMP / f"dl_{random.randint(100000, 999999)}{suffix}"
     with requests.get(url, stream=True, timeout=120) as resp:
         resp.raise_for_status()
         with open(p, "wb") as f:
@@ -83,23 +89,24 @@ def download_to_tmp(url, suffix):
                     f.write(chunk)
     return str(p)
 
-# -------- Text overlays (PIL -> PNG -> ImageClip) --------
+
+# ---------- Text overlays (PIL -> PNG -> ImageClip) ----------
 def make_text_panel(text, width=980, font_size=64, pad=20,
                     fg=(255, 255, 255, 255), bg=(11, 31, 59, 200)):
-    # word-wrap text onto a semi-transparent panel (PNG), return numpy array
+    # Word-wrap onto a semi-transparent panel and return a numpy image
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
     except Exception:
         font = ImageFont.load_default()
 
-    # measure lines by pixel width
+    # Measure by pixel width
     dummy = Image.new("RGB", (width, 10))
     draw = ImageDraw.Draw(dummy)
     words = (text or "").split()
     lines, line = [], ""
     for w in words:
         test = (line + " " + w).strip()
-        if draw.textlength(test, font=font) > width - 2 * pad:
+        if draw.textlength(test, font=font) > width - 2*pad:
             if line:
                 lines.append(line)
             line = w
@@ -108,14 +115,14 @@ def make_text_panel(text, width=980, font_size=64, pad=20,
     if line:
         lines.append(line)
 
-    height = pad * 2 + int(len(lines) * (font_size * 1.2))
-    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    height = pad*2 + int(len(lines) * (font_size * 1.2 or 1))
+    img = Image.new("RGBA", (width, max(height, font_size + 2*pad)), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rectangle([0, 0, width, height], fill=bg)
+    d.rectangle([0, 0, width, img.size[1]], fill=bg)
     y = pad
     for ln in lines:
         d.text((pad, y), ln, font=font, fill=fg)
-        y += int(font_size * 1.2)
+        y += int(font_size * 1.2 or font_size)
 
     return np.array(img)
 
@@ -126,53 +133,54 @@ def pick_music():
         return None
 
 def synthesize_tts(script_text, out_wav_path):
-    # pyttsx3 reliably writes wav; we keep it simple
     eng = pyttsx3.init()
     eng.setProperty("rate", 170)
     eng.save_to_file(script_text, out_wav_path)
     eng.runAndWait()
 
-# -------- Build a simple 9:16 short --------
+
+# ---------- Build a simple 9:16 short ----------
 def build_video(title, overlay, script, broll_kw, music_path=None):
-    # 1) background 9:16
+    # 1) Background 1080x1920
     clip_url = pexels_portrait_video(broll_kw or "forex charts")
     if clip_url:
         local = download_to_tmp(clip_url, ".mp4")
-        bg = VideoFileClip(local).without_audio()
-        # fit to 1080x1920
-        bg = bg.resize(height=1920)
+        bg = VideoFileClip(local).without_audio().resize(height=1920)
         if bg.w != 1080:
             x1 = max(0, (bg.w - 1080) // 2)
-            bg = bg.crop(x1=x1, y1=0, x2=x1 + 1080, y2=1920)
+            bg = bg.crop(x1=x1, y1=0, x2=x1+1080, y2=1920)
         bg = bg.subclip(0, min(bg.duration, 45))
     else:
-        # solid fallback (no network)
         bg = ColorClip(size=(1080, 1920), color=(10, 10, 10)).set_duration(30)
 
     dur = min(bg.duration, 60)
 
-    # 2) voiceover (free TTS -> wav)
+    # 2) Voiceover (keep its natural length; trim tiny epsilon to avoid float-edge read)
     vo_wav = TMP / "voice.wav"
     synthesize_tts(script or title, str(vo_wav))
     voice = AudioFileClip(str(vo_wav))
+    if voice.duration and voice.duration > 0.03:
+        voice = voice.subclip(0, min(voice.duration - 0.02, dur - 0.02))
 
-    # 3) music (optional, quiet under VO)
-    audio = voice.set_duration(dur)
+    # 3) Music (optional, quiet under VO); mix with CompositeAudioClip
     if music_path and Path(music_path).exists():
-        mus = AudioFileClip(music_path).volumex(0.2).set_duration(dur)
-        audio = CompositeAudioClip([mus, voice.set_duration(dur)])
+        mus = AudioFileClip(music_path).volumex(0.2).audio_fadein(0.3).audio_fadeout(0.3)
+        mus = mus.set_duration(dur)
+        audio = CompositeAudioClip([mus, voice]).set_duration(dur)
+    else:
+        audio = voice  # no stretching
 
-    # 4) text overlays (PIL -> ImageClip)
+    # 4) Text overlays (PIL -> ImageClip)
     top_img = make_text_panel(overlay or title)
     top = ImageClip(top_img).set_duration(dur).set_position(("center", "top")).margin(top=80)
-
     cta_img = make_text_panel("ZenithFX.com", width=600, font_size=56)
     cta = ImageClip(cta_img).set_duration(dur).set_position(("center", "bottom")).margin(bottom=80)
 
-    out = CompositeVideoClip([bg, top, cta], size=(1080, 1920))
-    return out.set_audio(audio)
+    out = CompositeVideoClip([bg, top, cta], size=(1080, 1920)).set_audio(audio)
+    return out.set_duration(dur)
 
-# -------- Upload to YouTube as private with publishAt (scheduling) --------
+
+# ---------- Upload (private + publishAt = official scheduling) ----------
 def upload_scheduled(youtube, mp4_path, title, desc, hashtags, publish_at_iso, link):
     body = {
         "snippet": {
@@ -180,7 +188,6 @@ def upload_scheduled(youtube, mp4_path, title, desc, hashtags, publish_at_iso, l
             "description": f"{desc}\n\nThis video features content by Forex Voyage.\n{link or 'https://zenithfx.com/'}\n{hashtags or ''}",
             "categoryId": "27"
         },
-        # Scheduling requires private + publishAt (ISO-8601 UTC)
         "status": {
             "privacyStatus": "private",
             "publishAt": publish_at_iso,
@@ -194,13 +201,16 @@ def upload_scheduled(youtube, mp4_path, title, desc, hashtags, publish_at_iso, l
         status, resp = req.next_chunk()
     return resp.get("id")
 
-# -------- Main --------
+
+# ---------- Main ----------
 def main():
     df = pd.read_csv("prompts.csv")
     now_pt = datetime.datetime.now(PT)
 
     # pick next 5 future rows
-    df["dt"] = df["PublishTime_Pacific"].apply(lambda s: PT.localize(datetime.datetime.strptime(s, "%Y-%m-%d %H:%M")))
+    df["dt"] = df["PublishTime_Pacific"].apply(
+        lambda s: PT.localize(datetime.datetime.strptime(s, "%Y-%m-%d %H:%M"))
+    )
     future = df[df["dt"] > now_pt].sort_values("dt").head(5)
     if future.empty:
         print("No future rows to process.")
