@@ -1,10 +1,10 @@
-name: Make & Upload Forex Videos (FREE)
+name: "Make & Upload Forex Videos (FREE)"
 
 on:
   schedule:
-    # Runs hourly at minute 5 (UTC). GitHub cron uses **UTC** times.
+    # Runs hourly at minute 5 (UTC). GitHub schedules are always UTC.
     - cron: "5 * * * *"
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   build:
@@ -18,16 +18,16 @@ jobs:
         with:
           python-version: "3.11"
 
-           - name: Install system tools (FFmpeg + eSpeak + fonts)
+      - name: Install system tools (FFmpeg + eSpeak + fonts)
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg espeak-ng fonts-dejavu-core
-
 
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+          python -m pip install "Pillow<10.0"
 
       - name: Generate & upload videos (schedule)
         env:
