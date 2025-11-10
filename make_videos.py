@@ -1,6 +1,5 @@
 # make_videos.py  (ASCII-only; safe on GitHub Actions)
 import os
-import textwrap
 import datetime
 import random
 from pathlib import Path
@@ -10,14 +9,14 @@ import pandas as pd
 from pytz import timezone, UTC
 import requests
 
-# MoviePy (no ImageMagick needed; we draw text with PIL and drop as ImageClip)
+# MoviePy (no ImageMagick; we draw text with PIL and load as ImageClip)
 from moviepy.editor import VideoFileClip, ImageClip, AudioFileClip, CompositeVideoClip, ColorClip
 from moviepy.audio.AudioClip import CompositeAudioClip
 
 # Free TTS (uses espeak-ng on Ubuntu runner)
 import pyttsx3
 
-# PIL for drawing text panels (no ImageMagick)
+# PIL for drawing text panels (no ImageMagick needed)
 from PIL import Image, ImageDraw, ImageFont
 
 # YouTube API client
@@ -37,7 +36,6 @@ RENDERS = Path("renders"); RENDERS.mkdir(exist_ok=True)
 TMP     = Path("tmp"); TMP.mkdir(exist_ok=True)
 MUSIC_DIR = Path("music")  # optional mp3s from YouTube Audio Library
 
-
 # ---------- YouTube helpers ----------
 def yt_client():
     if not (YT_CLIENT_ID and YT_CLIENT_SECRET and YT_REFRESH_TOKEN):
@@ -56,7 +54,6 @@ def schedule_to_iso_utc(pacific_str):
     # CSV uses Pacific local time; YouTube needs ISO-8601 UTC for publishAt
     dt_pt = PT.localize(datetime.datetime.strptime(pacific_str, "%Y-%m-%d %H:%M"))
     return dt_pt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
 
 # ---------- Pexels helpers ----------
 def pexels_portrait_video(query):
@@ -89,7 +86,6 @@ def download_to_tmp(url, suffix):
                     f.write(chunk)
     return str(p)
 
-
 # ---------- Text overlays (PIL -> PNG -> ImageClip) ----------
 def make_text_panel(text, width=980, font_size=64, pad=20,
                     fg=(255, 255, 255, 255), bg=(11, 31, 59, 200)):
@@ -115,14 +111,14 @@ def make_text_panel(text, width=980, font_size=64, pad=20,
     if line:
         lines.append(line)
 
-    height = pad*2 + int(len(lines) * (font_size * 1.2 or 1))
+    height = pad*2 + int(len(lines) * max(font_size * 1.2, font_size))
     img = Image.new("RGBA", (width, max(height, font_size + 2*pad)), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rectangle([0, 0, width, img.size[1]], fill=bg)
     y = pad
     for ln in lines:
         d.text((pad, y), ln, font=font, fill=fg)
-        y += int(font_size * 1.2 or font_size)
+        y += int(max(font_size * 1.2, font_size))
 
     return np.array(img)
 
@@ -137,7 +133,6 @@ def synthesize_tts(script_text, out_wav_path):
     eng.setProperty("rate", 170)
     eng.save_to_file(script_text, out_wav_path)
     eng.runAndWait()
-
 
 # ---------- Build a simple 9:16 short ----------
 def build_video(title, overlay, script, broll_kw, music_path=None):
@@ -155,20 +150,22 @@ def build_video(title, overlay, script, broll_kw, music_path=None):
 
     dur = min(bg.duration, 60)
 
-    # 2) Voiceover (keep its natural length; trim tiny epsilon to avoid float-edge read)
+    # 2) Voiceover (keep natural length; explicitly set start/end to avoid read-past-end)
     vo_wav = TMP / "voice.wav"
     synthesize_tts(script or title, str(vo_wav))
     voice = AudioFileClip(str(vo_wav))
-    if voice.duration and voice.duration > 0.03:
-        voice = voice.subclip(0, min(voice.duration - 0.02, dur - 0.02))
+    vdur = float(voice.duration or 0.0)
+    # Give ~0.25s safety margin and clamp to video duration
+    safe_end = max(0.0, min(vdur, dur) - 0.25)
+    voice = voice.set_start(0).set_end(safe_end)
 
     # 3) Music (optional, quiet under VO); mix with CompositeAudioClip
     if music_path and Path(music_path).exists():
-        mus = AudioFileClip(music_path).volumex(0.2).audio_fadein(0.3).audio_fadeout(0.3)
-        mus = mus.set_duration(dur)
+        mus = AudioFileClip(music_path).volumex(0.2).audio_fadein(0.3).audio_fadeout(0.3).set_duration(dur)
         audio = CompositeAudioClip([mus, voice]).set_duration(dur)
     else:
-        audio = voice  # no stretching
+        # no music: just the voice (no stretching)
+        audio = voice
 
     # 4) Text overlays (PIL -> ImageClip)
     top_img = make_text_panel(overlay or title)
@@ -178,7 +175,6 @@ def build_video(title, overlay, script, broll_kw, music_path=None):
 
     out = CompositeVideoClip([bg, top, cta], size=(1080, 1920)).set_audio(audio)
     return out.set_duration(dur)
-
 
 # ---------- Upload (private + publishAt = official scheduling) ----------
 def upload_scheduled(youtube, mp4_path, title, desc, hashtags, publish_at_iso, link):
@@ -200,7 +196,6 @@ def upload_scheduled(youtube, mp4_path, title, desc, hashtags, publish_at_iso, l
     while resp is None:
         status, resp = req.next_chunk()
     return resp.get("id")
-
 
 # ---------- Main ----------
 def main():
@@ -235,6 +230,7 @@ def main():
         clip.write_videofile(
             str(out_path),
             fps=30,
+            audio_fps=44100,          # stable audio stepping
             audio_codec="aac",
             codec="libx264",
             preset="medium"
