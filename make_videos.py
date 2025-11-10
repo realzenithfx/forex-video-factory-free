@@ -3,6 +3,7 @@ import os
 import datetime
 import random
 from pathlib import Path
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -12,7 +13,6 @@ import requests
 from moviepy.editor import VideoFileClip, ImageClip, AudioFileClip, CompositeVideoClip, ColorClip
 from moviepy.audio.AudioClip import CompositeAudioClip, AudioClip  # for silence
 
-import pyttsx3
 from PIL import Image, ImageDraw, ImageFont
 
 from google.oauth2.credentials import Credentials
@@ -28,7 +28,10 @@ YT_REFRESH_TOKEN = os.getenv("YT_REFRESH_TOKEN")
 PT = timezone("America/Los_Angeles")
 RENDERS = Path("renders"); RENDERS.mkdir(exist_ok=True)
 TMP     = Path("tmp"); TMP.mkdir(exist_ok=True)
-MUSIC_DIR = Path("music")  # optional
+MUSIC_DIR = Path("music")
+VOICES_DIR = Path("voices")
+PIPER_MODEL = VOICES_DIR / "en_US-amy-medium.onnx"
+PIPER_CFG   = VOICES_DIR / "en_US-amy-medium.onnx.json"
 
 # ---- YouTube client ----
 def yt_client():
@@ -48,7 +51,7 @@ def schedule_to_iso_utc(pacific_str):
     dt_pt = PT.localize(datetime.datetime.strptime(pacific_str, "%Y-%m-%d %H:%M"))
     return dt_pt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# ---- Pexels ----
+# ---- Pexels (free for commercial use; no attribution required) ----
 def pexels_portrait_video(query):
     if not PEXELS_API_KEY:
         return None
@@ -77,7 +80,7 @@ def download_to_tmp(url, suffix):
                 if chunk: f.write(chunk)
     return str(p)
 
-# ---- Text (PIL -> ImageClip) ----
+# ---- Text overlays (PIL -> ImageClip) ----
 def make_text_panel(text, width=980, font_size=64, pad=20,
                     fg=(255,255,255,255), bg=(11,31,59,200)):
     try:
@@ -109,16 +112,21 @@ def make_text_panel(text, width=980, font_size=64, pad=20,
     return np.array(img)
 
 def pick_music():
-    try:
-        return str(next(MUSIC_DIR.glob("*.mp3")))
-    except StopIteration:
+    paths = list(MUSIC_DIR.glob("*.mp3"))
+    if not paths:
+        print("No music found in ./music")
         return None
+    return str(random.choice(paths))  # rotate tracks for variety
 
-def synthesize_tts(script_text, out_wav_path):
-    eng = pyttsx3.init()
-    eng.setProperty("rate", 170)
-    eng.save_to_file(script_text, out_wav_path)
-    eng.runAndWait()
+# ---- Piper TTS (natural, offline) ----
+def tts_with_piper(text, out_wav):
+    cmd = ["piper", "-m", str(PIPER_MODEL), "-f", out_wav]
+    if PIPER_CFG.exists():
+        cmd += ["-c", str(PIPER_CFG)]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    _ = proc.communicate(input=(text or "").encode("utf-8"))
+    if proc.returncode != 0:
+        raise RuntimeError("Piper TTS failed")
 
 # ---- Audio helpers ----
 def make_silence(duration, fps=44100, nch=2):
@@ -126,7 +134,7 @@ def make_silence(duration, fps=44100, nch=2):
         return np.zeros((nch,), dtype=np.float32)
     return AudioClip(make_frame=frame_fn, duration=duration, fps=fps)
 
-# ---- Build video ----
+# ---- Build a single 9:16 video ----
 def build_video(title, overlay, script, broll_kw, music_path=None):
     # Background 1080x1920
     clip_url = pexels_portrait_video(broll_kw or "forex charts")
@@ -142,21 +150,24 @@ def build_video(title, overlay, script, broll_kw, music_path=None):
 
     dur = min(bg.duration, 60)
 
-    # Voice (natural length, then clamp safely)
+    # Voice (Piper)
     vo_wav = TMP / "voice.wav"
-    synthesize_tts(script or title, str(vo_wav))
+    tts_with_piper(script or title, str(vo_wav))
     voice_file = AudioFileClip(str(vo_wav))
     vdur = float(voice_file.duration or 0.0)
-    safe_end = max(0.0, min(vdur, dur) - 0.10)  # small margin
-    voice = voice_file.set_start(0).set_end(safe_end)
+    if vdur <= 0.1:
+        # fallback short blip
+        vdur = 1.0
+    safe_end = max(0.0, min(vdur, dur) - 0.10)
+    voice = voice_file.set_start(0).set_end(safe_end).volumex(1.0)
 
-    # Music underlay + silent bed so mixer never queries beyond end
+    # Music + silent bed so mixer never queries past end
     bed = make_silence(dur, fps=44100, nch=2)
+    layers = [bed, voice]
     if music_path and Path(music_path).exists():
-        mus = AudioFileClip(music_path).volumex(0.2).audio_fadein(0.3).audio_fadeout(0.3).set_duration(dur)
-        audio = CompositeAudioClip([bed, mus, voice]).set_duration(dur)
-    else:
-        audio = CompositeAudioClip([bed, voice]).set_duration(dur)
+        mus = AudioFileClip(music_path).volumex(0.35).audio_fadein(1.0).audio_fadeout(1.0).set_duration(dur)
+        layers.insert(1, mus)  # put music under voice
+    audio = CompositeAudioClip(layers).set_duration(dur)
 
     # Text overlays
     top_img = make_text_panel(overlay or title)
@@ -167,7 +178,7 @@ def build_video(title, overlay, script, broll_kw, music_path=None):
     out = CompositeVideoClip([bg, top, cta], size=(1080,1920)).set_audio(audio)
     return out.set_duration(dur)
 
-# ---- Upload (private + publishAt) ----
+# ---- Upload (official scheduling: private + publishAt ISO-8601 UTC) ----
 def upload_scheduled(youtube, mp4_path, title, desc, hashtags, publish_at_iso, link):
     body = {
         "snippet": {
@@ -213,6 +224,8 @@ def main():
         publish_iso = schedule_to_iso_utc(str(row["PublishTime_Pacific"]))
 
         music = pick_music()
+        print("Picked music:", music)
+
         clip = build_video(title, overlay, script, broll, music)
 
         safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title)[:30]
